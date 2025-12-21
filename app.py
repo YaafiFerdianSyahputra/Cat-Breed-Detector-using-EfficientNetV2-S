@@ -6,6 +6,9 @@
 import streamlit as st
 import torch
 import torch.nn as nn
+# --- [BARU] Import untuk Faster R-CNN ---
+from torchvision.models.detection import fasterrcnn_resnet50_fpn, FasterRCNN_ResNet50_FPN_Weights
+# ----------------------------------------
 from torchvision.models import efficientnet_v2_s, EfficientNet_V2_S_Weights
 from torchvision import transforms
 from PIL import Image
@@ -61,7 +64,7 @@ IDX_TO_CLASS = {
 }
 
 # ------------------------------------------------------
-# Image Transform
+# Image Transform (EfficientNet)
 # ------------------------------------------------------
 transform = transforms.Compose([
     transforms.Resize(256),
@@ -74,12 +77,12 @@ transform = transforms.Compose([
 ])
 
 # ------------------------------------------------------
-# Load Model
+# Load Model (Classifier)
 # ------------------------------------------------------
 @st.cache_resource
 def load_model():
     if not os.path.exists(MODEL_PATH):
-        with st.spinner("⬇️ Downloading model from Hugging Face..."):
+        with st.spinner("⬇️ Downloading Classifier model..."):
             urllib.request.urlretrieve(MODEL_URL, MODEL_PATH)
 
     weights = EfficientNet_V2_S_Weights.IMAGENET1K_V1
@@ -102,6 +105,46 @@ def load_model():
 model = load_model()
 
 # ------------------------------------------------------
+# [BARU] Load Detector (Faster R-CNN) & Crop Logic
+# ------------------------------------------------------
+@st.cache_resource
+def load_detector():
+    # Menggunakan Faster R-CNN pre-trained (COCO weights)
+    weights = FasterRCNN_ResNet50_FPN_Weights.DEFAULT
+    det_model = fasterrcnn_resnet50_fpn(weights=weights)
+    det_model.to(DEVICE)
+    det_model.eval()
+    return det_model
+
+def crop_cat_from_image(det_model, original_image):
+    # Transform sederhana untuk detector (hanya ubah ke Tensor)
+    det_transform = transforms.Compose([transforms.ToTensor()])
+    img_tensor = det_transform(original_image).to(DEVICE).unsqueeze(0)
+
+    with torch.no_grad():
+        predictions = det_model(img_tensor)[0]
+
+    # COCO Class ID untuk 'Cat' adalah 17
+    # Kita cari label 17 dengan confidence score > 0.5
+    boxes = predictions['boxes']
+    labels = predictions['labels']
+    scores = predictions['scores']
+
+    cat_indices = [i for i, label in enumerate(labels) if label == 17 and scores[i] > 0.5]
+
+    if len(cat_indices) > 0:
+        # Ambil kucing dengan score tertinggi
+        best_idx = cat_indices[0]
+        box = boxes[best_idx].cpu().numpy()
+        
+        # Koordinat box: x_min, y_min, x_max, y_max
+        # Crop image menggunakan PIL
+        cropped_img = original_image.crop((box[0], box[1], box[2], box[3]))
+        return cropped_img, True # Return True jika berhasil crop
+    
+    return original_image, False # Return False jika tidak ketemu kucing
+
+# ------------------------------------------------------
 # Helper: Load image from URL
 # ------------------------------------------------------
 def load_image_from_url(url: str) -> Image.Image:
@@ -117,10 +160,11 @@ st.markdown(
     """
 A deep learning–based application that predicts **cat breeds** using a  
 **fine-tuned EfficientNetV2-S** model.
-
-Choose **one input method** below:
 """
 )
+
+# --- [BARU] Checkbox Auto-Crop ---
+use_autocrop = st.checkbox("✂️ Gunakan Auto-Crop (Faster R-CNN)", value=True, help="Otomatis memotong background agar fokus ke kucing.")
 
 st.divider()
 
@@ -158,12 +202,39 @@ else:
 # Prediction
 # ------------------------------------------------------
 if image is not None:
+    # Simpan gambar asli untuk preview awal
+    original_display = image.copy()
+    image_to_process = image
+
+    # --- [BARU] Proses Auto-Crop jika dicentang ---
+    if use_autocrop:
+        with st.spinner("✂️ Detecting & Cropping cat area..."):
+            detector = load_detector() # Load model detector (cached)
+            image_to_process, was_cropped = crop_cat_from_image(detector, image)
+            
+            if was_cropped:
+                st.success("✅ Cat detected & cropped!")
+            else:
+                st.warning("⚠️ No cat detected clearly. Using full image.")
+
     st.subheader("🖼️ Image Preview")
-    st.image(image, use_container_width=True)
+    
+    # Tampilkan gambar berdampingan (Original vs Cropped) jika di-crop
+    if use_autocrop and 'was_cropped' in locals() and was_cropped:
+        col1, col2 = st.columns(2)
+        with col1:
+            st.caption("Original")
+            st.image(original_display, use_container_width=True)
+        with col2:
+            st.caption("Auto-Cropped Input")
+            st.image(image_to_process, use_container_width=True)
+    else:
+        st.image(image_to_process, use_container_width=True)
 
-    input_tensor = transform(image).unsqueeze(0).to(DEVICE)
+    # Lanjut ke proses normal (EfficientNet)
+    input_tensor = transform(image_to_process).unsqueeze(0).to(DEVICE)
 
-    with st.spinner("🔍 Analyzing image..."):
+    with st.spinner("🔍 Analyzing breed..."):
         with torch.no_grad():
             output = model(input_tensor)
             probs = torch.exp(output)[0]
